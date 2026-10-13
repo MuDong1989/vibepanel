@@ -26359,6 +26359,47 @@ session's cwd is set wrong so the tick putting it right is the proof. 9.6 s
 under -race to 2.15 s; what is left is the test server's own teardown, the
 same two seconds forty other tests in the package pay (see the report this
 went with). Taking the fix in `pollOnce` back out still fails it.
+
+**Every Detach of a settled attachment took two seconds.** A tmux client
+does not exit when its PTY closes. The pump reaps the client before it
+reports done, `Detach` waits for the pump, and the client went only when the
+kill timer took it two seconds later -- so deleting a session, deleting a
+project and each restart waited that long per attachment, and forty tests
+in `internal/httpapi` paid it in their teardown. `closeInternal` now sends
+the client SIGTERM before it waits (its own clean exit, a millisecond); the
+timer's SIGKILL stays for a client that ignores it. This is the panel's own
+tmux client; the session's process is the tmux server's child and is not
+touched (red line 2). `TestDetachReturnsAsSoonAsThePumpCan` detaches an
+attachment that has settled for 300 ms: 2.001 s before, immediate now.
+`internal/httpapi` went from 236.5 s to 111.7 s (without -race).
+
+Two wrong turns on the way, written down because both looked right. The
+first diagnosis was creack/pty's `Setsize` going through `File.Fd()`, which
+does leave the descriptor blocking for good -- but making it non-blocking
+alone changed nothing, and with the SIGTERM it is not needed, so that change
+was dropped. The second was to report the pump done before reaping the
+client, which made Detach fast and broke its promise: a client still
+connected for a moment took the bell that should have latched
+(`TestABellThatRangWhileThePumpWasDownIsSeen` failed), and a panel exiting
+straight after `DetachAll` would have left clients attached. Detach still
+returns only once the client is gone; it is just told to go.
+
+Next, not done here: `pollTmuxBudget` and `jsSlots` are package variables a
+test changes, and want to be `Server` fields before anything in the package
+can run with `t.Parallel`.
+
+**One race, two exits.** Making Detach fast exposed a write that had
+always been in flight at teardown: the output stamp `HandleSignals` starts
+off the pump. Landing after the database was closed, it reopened the
+write-ahead log -- in a test, while `t.TempDir` was removing the directory
+("unlinkat: directory not empty", `TestRestartingAVanishedSessionRecreatesIt`
+under `make check`); in production, on `systemctl stop`, after the panel had
+closed its database. The two seconds every Detach used to take had been long
+enough for it to finish. The write is counted now (`Server.background`):
+the test server detaches and waits for it before closing the database, and
+`cmdServe` waits for it too, bounded at two seconds with a log line, so a
+stop is never held by it. `TestWaitingForBackgroundWritesIsBounded`.
+
 ## 2026-10-13 — The UI and device audit, batch 3
 
 **Two console messages on every share page.** Chromium logged

@@ -122,6 +122,10 @@ type Server struct {
 	serviceCtx context.Context
 	// streams is what EndStreams closes: streams.go.
 	streams streamStop
+	// background counts the database writes started off a request and off
+	// the poller -- the output stamp HandleSignals makes on the pump's behalf
+	// -- so a caller about to close the database can wait for them.
+	background sync.WaitGroup
 
 	// Restart asks the process to stop and be brought back by whatever
 	// supervises it. Nil in tests and in the admin CLI, which is also what the
@@ -1078,14 +1082,34 @@ func (s *Server) HandleSignals(sig session.Signals) {
 	s.outMu.Unlock()
 
 	// Off the pump goroutine: a database write must never sit between the PTY
-	// and the viewers watching it.
+	// and the viewers watching it. Counted in background, so whoever closes
+	// the database can wait for it first (a test server does).
+	s.background.Add(1)
 	go func() {
+		defer s.background.Done()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := s.DB.TouchSessionOutput(ctx, sig.SessionID, now.Unix()); err != nil {
 			s.Log.Debug("touch output", "session", sig.SessionID, "err", err)
 		}
 	}()
+}
+
+// WaitBackground waits up to d for the database writes HandleSignals started
+// off the pump, and reports whether they finished. The shutdown path calls it
+// before the database closes; the test servers wait unbounded.
+func (s *Server) WaitBackground(d time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		s.background.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(d):
+		return false
+	}
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

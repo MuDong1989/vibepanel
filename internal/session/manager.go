@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/creack/pty"
@@ -1346,6 +1347,23 @@ func (l *Live) closeInternal(waitForPump bool) {
 
 	close(l.done)
 
+	// Ask the tmux client to go, now, and before the wait below.
+	//
+	// A tmux client does not exit when its PTY closes. The pump reaps it
+	// before it reports done, so awaitPump waited for the client, and the
+	// client waited for the SIGKILL the timer below sends two seconds later:
+	// every Detach of an attachment more than a moment old took two seconds
+	// -- deleting a session, deleting a project, a restart -- and forty tests
+	// in internal/httpapi paid it in their teardown. SIGTERM is the client's
+	// own clean exit, measured at a millisecond; the timer stays for a client
+	// that ignores it. This is the panel's own tmux client, not the session:
+	// the session's process is the tmux server's child and runs on (red line
+	// 2), and Detach still returns only once the client is gone, so the
+	// session is left with no client of ours attached.
+	if l.cmd.Process != nil {
+		_ = l.cmd.Process.Signal(syscall.SIGTERM)
+	}
+
 	// Wait for the pump to return before reporting the attachment ended.
 	//
 	// Without this, a chunk read just before the close is still in flight and
@@ -1358,9 +1376,7 @@ func (l *Live) closeInternal(waitForPump bool) {
 		l.awaitPump()
 	}
 
-	// Give the tmux client a moment to exit on its own after its PTY closed.
-	// Killing it immediately is usually unnecessary and occasionally races with
-	// tmux writing its final state.
+	// The SIGKILL, for a client that did not take the SIGTERM above.
 	go func() {
 		timer := time.NewTimer(2 * time.Second)
 		defer timer.Stop()

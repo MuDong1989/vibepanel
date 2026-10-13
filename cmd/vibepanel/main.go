@@ -505,6 +505,13 @@ func cmdServe(args []string) error {
 	// killing: every tmux session, and every agent inside it, keeps running.
 	stopServing(httpServer, srv, 10*time.Second)
 	mgr.DetachAll()
+	// Before the deferred database close: a write HandleSignals started off
+	// the pump can still be in flight, and landing after the close it
+	// reopens the write-ahead log of a database that is shutting down.
+	// Bounded, because a stop must not wait on anything for long.
+	if !srv.WaitBackground(2 * time.Second) {
+		logger.Warn("stopping with a background database write still in flight")
+	}
 	if restarting {
 		fmt.Println("\nrestarting; tmux sessions keep running")
 		return errRestart

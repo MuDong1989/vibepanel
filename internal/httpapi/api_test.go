@@ -149,6 +149,17 @@ func newUnconfiguredServer(t *testing.T) (*httptest.Server, *Server) {
 	// while t.TempDir is removing the directory -- which failed a release build
 	// with "unlinkat ...: directory not empty" on a test that had passed.
 	// Registered after the database's cleanup, so it runs before it.
+	//
+	// The same, for the output stamp HandleSignals writes off the pump. It
+	// was always in flight at teardown; it surfaced when Detach stopped
+	// taking two seconds, which had been long enough for it to finish.
+	// DetachAll first, here as well as in its own cleanup: a pump's last
+	// chunk as it closes can start one more, and the wait has to see it.
+	// cmdServe waits the same way, bounded, before it closes the database.
+	t.Cleanup(func() {
+		mgr.DetachAll()
+		srv.background.Wait()
+	})
 	t.Cleanup(func() {
 		// Some tests take the ingester away to see the endpoint refuse.
 		if srv.Tokens == nil {
@@ -3723,4 +3734,22 @@ func TestOutputIsStampedAtMostEveryFifteenSeconds(t *testing.T) {
 	if stamp() == 1 {
 		t.Error("output past the interval was never stamped")
 	}
+}
+
+// The shutdown's wait is bounded: a background write that never finishes
+// costs a stop two seconds and a log line, not the stop.
+func TestWaitingForBackgroundWritesIsBounded(t *testing.T) {
+	var s Server
+	if !s.WaitBackground(time.Second) {
+		t.Error("nothing in flight, and the wait said otherwise")
+	}
+	s.background.Add(1)
+	start := time.Now()
+	if s.WaitBackground(100 * time.Millisecond) {
+		t.Error("a write that never finished was reported finished")
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Errorf("the bounded wait took %v", took)
+	}
+	s.background.Done()
 }

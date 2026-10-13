@@ -1948,3 +1948,49 @@ func TestALateViewerIsToldThePanesModes(t *testing.T) {
 		t.Fatalf("a continued replay carried the modes again: continued=%v data=%q", again.Continued, string(again.Data))
 	}
 }
+
+// A Detach returns promptly. The client it ends is the panel's own tmux
+// client; the session's process is the tmux server's child and untouched
+// (red line 2).
+//
+// It took two seconds for any attachment more than a moment old: a tmux
+// client does not exit when its PTY closes, the pump reaps the client before
+// it reports done, Detach waits for the pump, and the client went only when
+// the kill timer two seconds later took it. Deleting a session, deleting a
+// project, a restart -- and forty tests in internal/httpapi in their teardown.
+func TestDetachReturnsAsSoonAsThePumpCan(t *testing.T) {
+	ctx := context.Background()
+	tm := newTestTmux(t)
+	m := NewManager(tm, 64<<10)
+	defer m.DetachAll()
+	if err := tm.Create(ctx, tmux.CreateOptions{
+		Name: "vp_quickdetach", Dir: t.TempDir(), Width: 80, Height: 24,
+		Command: []string{"sh", "-c", "sleep 60"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var worst time.Duration
+	for i := 0; i < 3; i++ {
+		l, err := m.Attach(ctx, "s1", "vp_quickdetach", 80, 24)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// A resize, as every viewer that subscribes makes one, and then a
+		// moment for the client to settle -- a Detach in the first instants
+		// after an attach was quick either way, which is how this went
+		// unnoticed, and every attachment a person deletes has been there
+		// far longer than this.
+		if err := l.Resize(l.Controller(), 100, 30); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(300 * time.Millisecond)
+		start := time.Now()
+		m.Detach("s1")
+		if took := time.Since(start); took > worst {
+			worst = took
+		}
+	}
+	if worst > 100*time.Millisecond {
+		t.Errorf("Detach took up to %v; it waits for the pump, and the pump should end when its PTY is closed", worst.Round(time.Millisecond))
+	}
+}
