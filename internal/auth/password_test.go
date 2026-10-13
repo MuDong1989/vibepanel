@@ -82,3 +82,16 @@ func TestMalformedHashesAreRejected(t *testing.T) {
 		}
 	}
 }
+
+// New hashes are made at t=2, m=64 MiB. SetCostForTests lowers that inside
+// test binaries only; this package's tests never call it, so what this sees is
+// what a running panel does.
+func TestNewHashesAreMadeAtTheProductionCost(t *testing.T) {
+	h, err := HashPassword("a sufficiently long password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(h, "$m=65536,t=2,") {
+		t.Errorf("a new hash is %q; production is m=65536 (64 MiB), t=2", h)
+	}
+}

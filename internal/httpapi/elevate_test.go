@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/jiangmuran/vibepanel/internal/auth"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -37,6 +38,9 @@ func TestMain(m *testing.M) {
 	if variant := os.Getenv("VP_FAKE_SUDO"); variant != "" {
 		os.Exit(fakeSudo(variant))
 	}
+	// Every test server signs up and signs in; at the production cost that
+	// was a minute of this package's run under -race. See SetCostForTests.
+	auth.SetCostForTests()
 	os.Exit(m.Run())
 }
 

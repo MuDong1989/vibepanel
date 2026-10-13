@@ -26400,6 +26400,17 @@ the test server detaches and waits for it before closing the database, and
 `cmdServe` waits for it too, bounded at two seconds with a log line, so a
 stop is never held by it. `TestWaitingForBackgroundWritesIsBounded`.
 
+**Test servers hash passwords at a test's cost.** Every test server signs up
+and signs in -- two argon2id runs at 64 MiB -- and `internal/httpapi` makes
+388 of them. `auth.SetCostForTests` lowers the cost of new hashes to one pass
+over 8 MiB for the rest of the process and panics outside a test binary;
+the httpapi `TestMain` calls it. Verification reads the cost from the hash,
+so nothing else changes. `TestNewHashesAreMadeAtTheProductionCost`, in a
+package whose tests never lower it, pins t=2, m=64 MiB. A test server went
+from about 55 ms to 35 ms, and under -race from about 450 ms to 375 ms --
+less than the report that proposed this estimated: most of what is left
+under -race is not hashing.
+
 ## 2026-10-13 — The UI and device audit, batch 3
 
 **Two console messages on every share page.** Chromium logged

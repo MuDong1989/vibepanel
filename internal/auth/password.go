@@ -15,6 +15,8 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
+	"testing"
 
 	"golang.org/x/crypto/argon2"
 )
@@ -31,6 +33,32 @@ const (
 	argonKeyLen  uint32 = 32
 	argonSaltLen        = 16
 )
+
+// The cost new hashes are made at: the constants above, unless a test
+// binary lowered them. Atomic because a test server's handlers hash on their
+// own goroutines.
+var costTime, costMemory atomic.Uint32
+
+func init() {
+	costTime.Store(argonTime)
+	costMemory.Store(argonMemory)
+}
+
+// SetCostForTests lowers the cost of new hashes for the rest of the process,
+// to one pass over 8 MiB. Every test server signs up and signs in, two
+// argon2id runs at 64 MiB each, and internal/httpapi makes 388 of them: about
+// a minute of its run under -race was password hashing. Verification reads
+// the cost from the hash, so a hash made here verifies like any other.
+//
+// It panics outside a test binary. Nothing else may call it: the production
+// cost is the constants, and TestNewHashesAreMadeAtTheProductionCost says so.
+func SetCostForTests() {
+	if !testing.Testing() {
+		panic("auth.SetCostForTests called outside a test binary")
+	}
+	costTime.Store(1)
+	costMemory.Store(8 * 1024)
+}
 
 // ErrBadHash means a stored hash could not be parsed.
 var ErrBadHash = errors.New("auth: malformed password hash")
@@ -55,9 +83,10 @@ func HashPassword(password string) (string, error) {
 	if threads == 0 {
 		threads = 1
 	}
-	key := argon2.IDKey([]byte(password), salt, argonTime, argonMemory, threads, argonKeyLen)
+	time, memory := costTime.Load(), costMemory.Load()
+	key := argon2.IDKey([]byte(password), salt, time, memory, threads, argonKeyLen)
 	return fmt.Sprintf("$argon2id$v=%d$m=%d,t=%d,p=%d$%s$%s",
-		argon2.Version, argonMemory, argonTime, threads,
+		argon2.Version, memory, time, threads,
 		base64.RawStdEncoding.EncodeToString(salt),
 		base64.RawStdEncoding.EncodeToString(key)), nil
 }
