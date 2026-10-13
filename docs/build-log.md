@@ -26349,6 +26349,16 @@ and it comes off `beyondTheAllowlist`. `TestSetupIsRefusedToAnAddressOffTheAllow
 posts the right token from loopback to a panel that allows only
 203.0.113.0/24: 201 and an account before, 403 and a `blocked` row now.
 
+**`TestOneFailedWriteDoesNotEndTheTick` waited on things it was not about.**
+It made the first session's write fail by holding the write lock, which
+fails it only after busy_timeout -- five seconds -- and it proved the loop
+went on by detaching the second session and watching the tick re-attach it,
+and a Detach that soon after an attach waited out the pump's two-second
+drain. A trigger now fails the first write at once, and the second
+session's cwd is set wrong so the tick putting it right is the proof. 9.6 s
+under -race to 2.15 s; what is left is the test server's own teardown, the
+same two seconds forty other tests in the package pay (see the report this
+went with). Taking the fix in `pollOnce` back out still fails it.
 ## 2026-10-13 — The UI and device audit, batch 3
 
 **Two console messages on every share page.** Chromium logged

@@ -657,28 +657,29 @@ func TestOneFailedWriteDoesNotEndTheTick(t *testing.T) {
 	if err := srv.pollOnce(ctx); err != nil {
 		t.Fatal(err)
 	}
-	// first sorts ahead and needs a write this tick; second needs attaching.
+	// first sorts ahead and needs a write this tick, and so does second: its
+	// cwd is set wrong as well, and the tick putting it right is the proof
+	// the loop got past first. (Detaching second to watch it be re-attached
+	// was the first version, and Detach right after an attach waited out
+	// the pump's two-second drain.)
+	// The write fails at once, by a trigger, rather than by holding the lock:
+	// a held lock fails it only after busy_timeout, five seconds of a test
+	// that is about what happens next.
 	if _, err := srv.DB.SQL().Exec(`UPDATE sessions SET pinned = 1, cwd = '/elsewhere' WHERE id = ?`, first.ID); err != nil {
 		t.Fatal(err)
 	}
-	srv.Manager.Detach(second.ID)
-	tx, err := srv.DB.SQL().BeginTx(ctx, nil)
-	if err != nil {
+	if _, err := srv.DB.SQL().Exec(`CREATE TRIGGER fail_first BEFORE UPDATE OF cwd ON sessions
+		WHEN NEW.id = '` + first.ID + `' BEGIN SELECT RAISE(ABORT, 'injected'); END`); err != nil {
 		t.Fatal(err)
 	}
-	defer tx.Rollback() //nolint:errcheck
-	if _, err := tx.ExecContext(ctx, `UPDATE settings SET value = value WHERE key = 'nothing'`); err != nil {
+	if _, err := srv.DB.SQL().Exec(`UPDATE sessions SET cwd = '/wrong' WHERE id = ?`, second.ID); err != nil {
 		t.Fatal(err)
 	}
-	// Long enough for the first session's write to wait out busy_timeout and
-	// fail on its own, rather than the whole tick running out of context.
-	pctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	if err := srv.pollOnce(pctx); err == nil {
+	if err := srv.pollOnce(ctx); err == nil {
 		t.Error("a tick whose write failed reported success")
 	}
-	if _, attached := srv.Manager.Get(second.ID); !attached {
-		t.Error("the session after the failed write was not attached that tick")
+	if got := getSession(t, srv, second.ID); got.CWD == "/wrong" {
+		t.Error("the session after the failed write was not reached that tick")
 	}
 }
 
