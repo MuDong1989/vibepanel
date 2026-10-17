@@ -391,8 +391,12 @@ func TestIngestPassCost(t *testing.T) {
 			biggest = r
 		}
 	}
-	if err := db.ForgetUsageFiles(context.Background(), []string{biggest.Path}); err != nil {
-		t.Fatalf("forget: %v", err)
+	// A stamp that no longer matches the file, which is what an append looks
+	// like to the cursor, without touching somebody's real transcript.
+	if err := db.ReplaceUsageFile(context.Background(), store.UsageFile{
+		Path: biggest.Path, Tool: string(ToolClaude), Size: -1, Reader: ReaderVersion,
+	}); err != nil {
+		t.Fatalf("stale stamp: %v", err)
 	}
 	one := in.RunNow(context.Background())
 	t.Logf("one %.0f MB transcript changed: %d/%d files read in %v",

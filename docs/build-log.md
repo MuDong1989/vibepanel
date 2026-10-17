@@ -26461,3 +26461,41 @@ tests replaced `a.now` with a bare assignment while `Run` was polling on
 its own goroutine, and `admit` reads the clock under `a.mu`. Thirty local
 runs never hit it; the two-core runner did, once. The tests go through
 `setClock`, which takes the lock. The adapter is unchanged.
+
+## 2026-10-17 — Token usage outlives its transcripts, and a request counts once
+
+Asked whether workflow and subagent tokens were being counted. They were: the
+reader walks `~/.claude/projects` recursively, `subagents/agent-*.jsonl` and
+`subagents/workflows/wf_*/agent-*.jsonl` included (1,498 subagent transcripts
+here, 971 of them from workflows), and an independent read of every file
+agreed with the panel's rows file for file. Two other things were wrong.
+
+**History disappeared.** A transcript gone from disk took its rows with it,
+on the reasoning that numbers nothing on disk backs up are an unfalsifiable
+claim. Claude Code deletes transcripts after thirty days by default, so the
+month view and the year heatmap emptied themselves a month at a time: the
+oldest Claude day in the panel was 2026-09-06 on a machine it had counted
+since August, and every workflow run older than that had vanished from the
+totals. Now a vanished file is retired (`usage_files.gone`): its rows stay, it
+is never read again, a zone-change rebuild leaves it alone because there is
+nothing to rebuild it from, and a file back at the same path is read as new.
+
+**A request in several transcripts counted in each.** 1,359 of 80,901
+requests sat in two to eight files -- a resumed session replaying history into
+a new transcript, forked subagents inheriting their parent's -- and each copy
+counted: 0.41B tokens, 1.96% over. The reader now keeps Claude's requests
+keyed (FNV-64 of `message.id` and `requestId`), `usage_requests` records which
+transcript holds each, and a transcript leaves out what another already holds.
+A retired transcript keeps holding its requests, so deleting the original does
+not start the copy counting. Migration 036; `ReaderVersion` 2, so every
+transcript is read once more on upgrade (6,317 files, 19 s here). Run on a
+copy of this machine's database: 21.50B in 97,059 Claude requests, against
+21.53B and 97,775 from an independent global dedupe minutes later while a
+workflow was still writing -- and 21.94B the old per-file way.
+
+The tests: `TestADeletedTranscriptKeepsWhatItCounted` (rows kept, never
+re-read, retired once and not again, read again when restored with the same
+bytes and mtime), `TestARequestInTwoTranscriptsIsCountedOnce` (once, still
+once after the holder is deleted, still once after the copy grows),
+`TestARetiredTranscriptKeepsItsNumbers` and `TestARequestIsHeldByOneTranscript`
+in the store. Each guard was removed in turn and each removal fails one of them.

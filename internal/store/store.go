@@ -1301,6 +1301,38 @@ var migrations = []migration{
 		}
 		return nil
 	}},
+	// What the agents spent outlives the transcripts it was read from, and one
+	// API request is counted once however many transcripts carry it.
+	//
+	// `gone` marks a transcript that is no longer on disk. Its rows used to be
+	// deleted with it, and Claude Code deletes transcripts after thirty days by
+	// default: the month view, the year heatmap and every total older than
+	// that emptied themselves out, a month at a time, while saying they were
+	// complete. Now a vanished file keeps its rows and is simply never read
+	// again.
+	//
+	// usage_requests holds the requests of the agents whose records carry an
+	// id (Claude Code's message.id and requestId, hashed to 64 bits), with the
+	// transcript that counted each. The same request turned up in two to eight
+	// files -- a resumed session replaying its history into a new transcript,
+	// a forked subagent inheriting its parent's -- and each file counted it:
+	// 1,359 of 80,901 requests here, 0.41B tokens, about 2%. The first file to
+	// record a request owns it; the others skip it.
+	{"036-usage-retain-and-dedupe", func(tx *sql.Tx) error {
+		for _, stmt := range []string{
+			`ALTER TABLE usage_files ADD COLUMN gone INTEGER NOT NULL DEFAULT 0`,
+			`CREATE TABLE IF NOT EXISTS usage_requests (
+			     key  INTEGER PRIMARY KEY,
+			     path TEXT NOT NULL REFERENCES usage_files(path) ON DELETE CASCADE
+			 )`,
+			`CREATE INDEX IF NOT EXISTS usage_requests_path ON usage_requests(path)`,
+		} {
+			if _, err := tx.Exec(stmt); err != nil {
+				return fmt.Errorf("%s: %w", stmt, err)
+			}
+		}
+		return nil
+	}},
 }
 
 // scanner is *sql.Row and *sql.Rows both, so one scan function serves a

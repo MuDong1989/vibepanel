@@ -27,6 +27,9 @@ type UsageStamp struct {
 	// migration v28: a stamp that matches the file on disk but not the
 	// current reader is a file that has to be read again.
 	Reader int
+	// Gone is a transcript no longer on disk whose rows are kept. See
+	// migration 036.
+	Gone bool
 }
 
 // UsageFile is one transcript's contribution, as it goes into the database.
@@ -40,6 +43,10 @@ type UsageFile struct {
 	// Reader is the reader version these rows came from.
 	Reader int
 	Rows   []UsageRow
+	// Keys are the requests these rows count, for the agents whose records
+	// carry an id. Each is claimed for this file unless another file already
+	// holds it; the caller has already left out the ones another file holds.
+	Keys []int64
 }
 
 // UsageRow is one (day, agent session, model) bucket.
@@ -58,7 +65,7 @@ type UsageRow struct {
 
 // UsageStamps returns every transcript the last pass recorded.
 func (d *DB) UsageStamps(ctx context.Context) (map[string]UsageStamp, error) {
-	rows, err := d.sql.QueryContext(ctx, `SELECT path, size, modified_at, tool, reader FROM usage_files`)
+	rows, err := d.sql.QueryContext(ctx, `SELECT path, size, modified_at, tool, reader, gone FROM usage_files`)
 	if err != nil {
 		return nil, fmt.Errorf("store: list usage files: %w", err)
 	}
@@ -68,7 +75,7 @@ func (d *DB) UsageStamps(ctx context.Context) (map[string]UsageStamp, error) {
 	for rows.Next() {
 		var p string
 		var s UsageStamp
-		if err := rows.Scan(&p, &s.Size, &s.ModifiedAt, &s.Tool, &s.Reader); err != nil {
+		if err := rows.Scan(&p, &s.Size, &s.ModifiedAt, &s.Tool, &s.Reader, &s.Gone); err != nil {
 			return nil, fmt.Errorf("store: scan usage file: %w", err)
 		}
 		out[p] = s
@@ -92,8 +99,8 @@ func (d *DB) ReplaceUsageFile(ctx context.Context, f UsageFile) error {
 	defer tx.Rollback() //nolint:errcheck // no-op after a commit
 
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO usage_files (path, tool, size, modified_at, scanned_at, skipped, problem, reader)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO usage_files (path, tool, size, modified_at, scanned_at, skipped, problem, reader, gone)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
 		ON CONFLICT(path) DO UPDATE SET
 			tool        = excluded.tool,
 			size        = excluded.size,
@@ -101,7 +108,8 @@ func (d *DB) ReplaceUsageFile(ctx context.Context, f UsageFile) error {
 			scanned_at  = excluded.scanned_at,
 			skipped     = excluded.skipped,
 			problem     = excluded.problem,
-			reader      = excluded.reader`,
+			reader      = excluded.reader,
+			gone        = 0`,
 		f.Path, f.Tool, f.Size, f.ModifiedAt, now(), f.Skipped, f.Problem, f.Reader); err != nil {
 		return fmt.Errorf("store: put usage file %s: %w", f.Path, err)
 	}
@@ -123,36 +131,101 @@ func (d *DB) ReplaceUsageFile(ctx context.Context, f UsageFile) error {
 			return fmt.Errorf("store: insert usage row for %s: %w", f.Path, err)
 		}
 	}
+	// The requests this file counts, replaced like its rows. INSERT OR IGNORE
+	// because the caller asked before reading which keys another file holds,
+	// and nothing else writes in between -- one pass, one goroutine -- so an
+	// ignored key here would be a request counted twice that the check
+	// missed, not a race.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM usage_requests WHERE path = ?`, f.Path); err != nil {
+		return fmt.Errorf("store: clear usage requests for %s: %w", f.Path, err)
+	}
+	if len(f.Keys) > 0 {
+		kstmt, err := tx.PrepareContext(ctx, `INSERT OR IGNORE INTO usage_requests (key, path) VALUES (?, ?)`)
+		if err != nil {
+			return fmt.Errorf("store: prepare usage request insert: %w", err)
+		}
+		defer kstmt.Close() //nolint:errcheck // closed by the transaction anyway
+		for _, k := range f.Keys {
+			if _, err := kstmt.ExecContext(ctx, k, f.Path); err != nil {
+				return fmt.Errorf("store: insert usage request for %s: %w", f.Path, err)
+			}
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("store: commit usage %s: %w", f.Path, err)
 	}
 	return nil
 }
 
-// ForgetUsageFiles drops transcripts that are no longer on disk.
+// UsageKeysHeldElsewhere returns which of keys another transcript than path
+// already counts.
 //
-// Agents do delete their own history, and a file that is gone must take its
-// numbers with it. Leaving them would make the totals a record of every
-// transcript that ever existed, which is a different and unfalsifiable claim:
-// nothing on disk would back it up any more.
-func (d *DB) ForgetUsageFiles(ctx context.Context, paths []string) error {
+// Asked in chunks: SQLite caps the parameters of one statement, and a long
+// session's transcript has tens of thousands of requests.
+func (d *DB) UsageKeysHeldElsewhere(ctx context.Context, path string, keys []int64) (map[int64]bool, error) {
+	held := map[int64]bool{}
+	const chunk = 500
+	for start := 0; start < len(keys); start += chunk {
+		end := min(start+chunk, len(keys))
+		part := keys[start:end]
+		args := make([]any, 0, len(part)+1)
+		args = append(args, path)
+		for _, k := range part {
+			args = append(args, k)
+		}
+		rows, err := d.sql.QueryContext(ctx,
+			`SELECT key FROM usage_requests WHERE path <> ? AND key IN (?`+strings.Repeat(",?", len(part)-1)+`)`,
+			args...)
+		if err != nil {
+			return nil, fmt.Errorf("store: usage requests held elsewhere: %w", err)
+		}
+		for rows.Next() {
+			var k int64
+			if err := rows.Scan(&k); err != nil {
+				rows.Close() //nolint:errcheck,gosec // returning the scan error
+				return nil, fmt.Errorf("store: scan usage request: %w", err)
+			}
+			held[k] = true
+		}
+		err = rows.Err()
+		rows.Close() //nolint:errcheck,gosec // read-only
+		if err != nil {
+			return nil, err
+		}
+	}
+	return held, nil
+}
+
+// RetireUsageFiles marks transcripts that are no longer on disk, keeping
+// what they counted.
+//
+// They used to be deleted, on the reasoning that numbers nothing on disk backs
+// up any more are an unfalsifiable claim. What that meant in practice: Claude
+// Code deletes transcripts after thirty days by default, so the month view and
+// the year heatmap emptied themselves a month at a time -- the oldest Claude
+// day here was five weeks ago on a panel that had been counting since August
+// -- and every workflow run older than that vanished from the totals. The
+// rows were read from the transcript when it existed; that is the record.
+//
+// A retired file is not read again (there is nothing to read) and keeps the
+// requests it holds, so a copy of one of them in another transcript stays
+// uncounted. If a file at the same path appears again it is read as new.
+func (d *DB) RetireUsageFiles(ctx context.Context, paths []string) error {
 	if len(paths) == 0 {
 		return nil
 	}
 	tx, err := d.sql.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("store: begin usage forget: %w", err)
+		return fmt.Errorf("store: begin usage retire: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op after a commit
 	for _, p := range paths {
-		// usage_daily has ON DELETE CASCADE, and foreign_keys is on for every
-		// pooled connection through the DSN. Deleting the parent is enough.
-		if _, err := tx.ExecContext(ctx, `DELETE FROM usage_files WHERE path = ?`, p); err != nil {
-			return fmt.Errorf("store: forget usage file %s: %w", p, err)
+		if _, err := tx.ExecContext(ctx, `UPDATE usage_files SET gone = 1 WHERE path = ?`, p); err != nil {
+			return fmt.Errorf("store: retire usage file %s: %w", p, err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("store: commit usage forget: %w", err)
+		return fmt.Errorf("store: commit usage retire: %w", err)
 	}
 	return nil
 }
@@ -477,7 +550,7 @@ func (d *DB) UsageByTool(ctx context.Context, f UsageFilter) (map[string]UsageTo
 	fileRows, err := d.sql.QueryContext(ctx, `
 		SELECT tool, COUNT(*), SUM(skipped), SUM(CASE WHEN problem <> '' THEN 1 ELSE 0 END),
 		       COALESCE(MAX(problem), '')
-		FROM usage_files GROUP BY tool`)
+		FROM usage_files WHERE gone = 0 GROUP BY tool`)
 	if err != nil {
 		return nil, fmt.Errorf("store: usage file stats: %w", err)
 	}
@@ -499,11 +572,9 @@ func (d *DB) UsageByTool(ctx context.Context, f UsageFilter) (map[string]UsageTo
 // ForgetEveryUsageFile drops the whole scan cursor, so the next pass re-reads
 // every transcript.
 //
-// Named apart from ForgetUsageFiles above, which removes the rows for
-// transcripts that are gone from disk. These two do the opposite thing to the
-// same table -- one is housekeeping, this one is a deliberate rebuild -- and
-// the compiler catching the collision is the only reason they are not one
-// function with a subtle argument.
+// Except the retired ones: a transcript that is gone cannot be read again, so
+// forgetting it would delete what it counted with nothing to rebuild it from.
+// Its days keep the zone they were read in.
 //
 // Used when the time zone changes, and only then. The day a record belongs to
 // is decided at ingest and written into usage_daily.day as a string; every
@@ -516,7 +587,7 @@ func (d *DB) UsageByTool(ctx context.Context, f UsageFilter) (map[string]UsageTo
 // both by hand would be two statements that can disagree, and the half-done
 // state is a panel reporting zero usage forever.
 func (d *DB) ForgetEveryUsageFile(ctx context.Context) (int64, error) {
-	res, err := d.sql.ExecContext(ctx, `DELETE FROM usage_files`)
+	res, err := d.sql.ExecContext(ctx, `DELETE FROM usage_files WHERE gone = 0`)
 	if err != nil {
 		return 0, fmt.Errorf("store: forget usage files: %w", err)
 	}

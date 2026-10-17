@@ -27,6 +27,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"io/fs"
 	"os"
@@ -137,9 +138,48 @@ type key struct{ day, session, model string }
 // travels to the UI as a problem rather than being swallowed.
 const maxLine = 16 << 20
 
+// Request is one API request a transcript recorded, before it is folded into
+// a Bucket. Only the readers whose records carry an id produce these (Claude
+// Code's message.id and requestId); Key is that id hashed to 64 bits, which is
+// what lets the ingest count a request once when several transcripts carry it.
+type Request struct {
+	Key     int64
+	Day     string
+	Session string
+	Model   string
+	CWD     string
+	Counts
+}
+
+// requestKey hashes a Claude request's identity. 64 bits of FNV-1a: at a few
+// hundred thousand requests a year the chance of any two colliding is around
+// one in a hundred million, and a collision costs one request's count.
+func requestKey(messageID, requestID string) int64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(messageID))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(requestID))
+	return int64(h.Sum64()) //nolint:gosec // a key, not a quantity; the sign is irrelevant
+}
+
+// Aggregate folds requests into the per-day, per-session, per-model buckets a
+// transcript's rows are made of. Each request counts as one.
+func Aggregate(reqs []Request) []Bucket {
+	agg := map[key]*Bucket{}
+	for _, r := range reqs {
+		c := r.Counts
+		c.Requests = 1
+		add(agg, key{r.Day, r.Session, r.Model}, r.CWD, c)
+	}
+	return flatten(agg)
+}
+
 // readResult is what one transcript file yielded.
 type readResult struct {
 	buckets []Bucket
+	// requests is what the buckets were made from, for the readers that can
+	// say which request is which. Nil for the others.
+	requests []Request
 	// skipped counts records that could not be read: overlong lines and
 	// malformed JSON. Reported rather than ignored, because "some of this
 	// file was unreadable" and "this file says zero" must not look alike.
@@ -216,13 +256,8 @@ func readClaude(r io.Reader, loc *time.Location) (readResult, error) {
 	// A request's bucket is decided by the first line seen for it; its counts
 	// are settled only when the file ends, which is why nothing is added to a
 	// bucket until then.
-	type request struct {
-		key key
-		cwd string
-		Counts
-	}
-	byID := map[string]*request{}
-	var order []*request
+	byID := map[string]*Request{}
+	var order []*Request
 
 	err := eachLine(r, &out.skipped, func(line []byte) {
 		// The cheap gate first. Most lines in a transcript are user messages
@@ -260,14 +295,17 @@ func readClaude(r io.Reader, loc *time.Location) (readResult, error) {
 			out.skipped++
 			return
 		}
-		req := &request{key: key{day, rec.SessionID, rec.Message.Model}, cwd: rec.CWD, Counts: c}
+		req := &Request{
+			Key: requestKey(rec.Message.ID, rec.RequestID),
+			Day: day, Session: rec.SessionID, Model: rec.Message.Model, CWD: rec.CWD,
+			Counts: c,
+		}
 		byID[dedupe] = req
 		order = append(order, req)
 	})
 	if err != nil {
 		return out, err
 	}
-	agg := map[key]*Bucket{}
 	for _, req := range order {
 		if req.Total() == 0 {
 			// Claude Code's own "<synthetic>" messages — an interrupted turn,
@@ -277,10 +315,9 @@ func readClaude(r io.Reader, loc *time.Location) (readResult, error) {
 			// denominator of "tokens per request".
 			continue
 		}
-		req.Requests = 1
-		add(agg, req.key, req.cwd, req.Counts)
+		out.requests = append(out.requests, *req)
 	}
-	out.buckets = flatten(agg)
+	out.buckets = Aggregate(out.requests)
 	return out, nil
 }
 
@@ -632,8 +669,12 @@ type File struct {
 	Size       int64
 	ModifiedAt int64
 	Buckets    []Bucket
-	Skipped    int
-	Problem    string
+	// Requests are the requests the buckets were made from, where the agent's
+	// records say which is which (Claude). The ingest uses them to leave out a
+	// request another transcript already counts, and re-aggregates.
+	Requests []Request
+	Skipped  int
+	Problem  string
 }
 
 // Scanner walks the agents' transcript directories.
@@ -896,6 +937,7 @@ func (s *Scanner) ReadFile(tool Tool, path string) File {
 		return f
 	}
 	f.Buckets = res.buckets
+	f.Requests = res.requests
 	f.Skipped = res.skipped
 	return f
 }

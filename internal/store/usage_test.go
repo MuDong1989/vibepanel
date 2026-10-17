@@ -48,32 +48,85 @@ func TestRereadingATranscriptReplacesItsRowsRatherThanAddingToThem(t *testing.T)
 	}
 }
 
-// A transcript that is gone takes its numbers with it. Otherwise the totals
-// become a record of every transcript that ever existed, which nothing on disk
-// backs up any more.
-func TestADeletedTranscriptTakesItsNumbersWithIt(t *testing.T) {
+// A transcript that is gone keeps what it counted.
+//
+// It used to take its numbers with it, and Claude Code deletes transcripts
+// after thirty days by default: the month view and the year heatmap emptied
+// themselves a month at a time. A retired file keeps its rows, is marked so the
+// pass never tries to read it, and survives the rebuild a zone change asks for,
+// because there is nothing left to rebuild it from.
+func TestARetiredTranscriptKeepsItsNumbers(t *testing.T) {
 	db := openTest(t)
 	ctx := context.Background()
 
 	put(t, db, "/t/a.jsonl", "claude", row("2026-08-20", "s1", "/p", "opus", 10, 20))
 	put(t, db, "/t/b.jsonl", "claude", row("2026-08-20", "s2", "/p", "opus", 1, 2))
-	if err := db.ForgetUsageFiles(ctx, []string{"/t/a.jsonl"}); err != nil {
-		t.Fatalf("forget: %v", err)
+	if err := db.RetireUsageFiles(ctx, []string{"/t/a.jsonl"}); err != nil {
+		t.Fatalf("retire: %v", err)
 	}
 
 	days, err := db.UsageByDay(ctx, UsageFilter{})
 	if err != nil {
 		t.Fatalf("by day: %v", err)
 	}
-	if len(days) != 1 || days[0].Output != 2 {
-		t.Fatalf("after forgetting a.jsonl the day is %+v; its rows outlived it", days)
+	if len(days) != 1 || days[0].Output != 22 {
+		t.Fatalf("after a.jsonl went the day is %+v, want 22 output tokens; what it counted went with it", days)
 	}
 	stamps, err := db.UsageStamps(ctx)
 	if err != nil {
 		t.Fatalf("stamps: %v", err)
 	}
-	if _, ok := stamps["/t/a.jsonl"]; ok {
-		t.Error("the cursor still holds a transcript that was forgotten, so it will never be re-read")
+	if !stamps["/t/a.jsonl"].Gone || stamps["/t/b.jsonl"].Gone {
+		t.Errorf("stamps %+v: only a.jsonl is gone", stamps)
+	}
+
+	if _, err := db.ForgetEveryUsageFile(ctx); err != nil {
+		t.Fatalf("forget every: %v", err)
+	}
+	days, err = db.UsageByDay(ctx, UsageFilter{})
+	if err != nil {
+		t.Fatalf("by day: %v", err)
+	}
+	if len(days) != 1 || days[0].Output != 20 {
+		t.Errorf("after a rebuild the day is %+v, want a.jsonl's 20 kept and b.jsonl's to be re-read", days)
+	}
+}
+
+// A request is held by the transcript that counted it, and a retired
+// transcript keeps holding it, so a copy elsewhere stays uncounted after the
+// original is deleted.
+func TestARequestIsHeldByOneTranscript(t *testing.T) {
+	db := openTest(t)
+	ctx := context.Background()
+	if err := db.ReplaceUsageFile(ctx, UsageFile{Path: "/t/a.jsonl", Tool: "claude", Keys: []int64{1, 2}}); err != nil {
+		t.Fatalf("put a: %v", err)
+	}
+	held, err := db.UsageKeysHeldElsewhere(ctx, "/t/b.jsonl", []int64{2, 3})
+	if err != nil {
+		t.Fatalf("held: %v", err)
+	}
+	if !held[2] || held[3] {
+		t.Errorf("held for b = %v, want only 2", held)
+	}
+	if held, _ := db.UsageKeysHeldElsewhere(ctx, "/t/a.jsonl", []int64{1, 2}); len(held) != 0 {
+		t.Errorf("a's own keys reported as held elsewhere: %v", held)
+	}
+	if err := db.RetireUsageFiles(ctx, []string{"/t/a.jsonl"}); err != nil {
+		t.Fatalf("retire: %v", err)
+	}
+	if held, _ := db.UsageKeysHeldElsewhere(ctx, "/t/b.jsonl", []int64{2}); !held[2] {
+		t.Error("a retired transcript stopped holding its requests; a copy of one would now count again")
+	}
+	// Many keys: SQLite's parameter limit is why the query is chunked.
+	many := make([]int64, 2500)
+	for i := range many {
+		many[i] = int64(i + 10)
+	}
+	if err := db.ReplaceUsageFile(ctx, UsageFile{Path: "/t/c.jsonl", Tool: "claude", Keys: many}); err != nil {
+		t.Fatalf("put c: %v", err)
+	}
+	if held, err := db.UsageKeysHeldElsewhere(ctx, "/t/d.jsonl", many); err != nil || len(held) != len(many) {
+		t.Errorf("held %d of %d keys (err %v)", len(held), len(many), err)
 	}
 }
 

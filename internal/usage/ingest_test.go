@@ -99,8 +99,12 @@ func TestAGrownTranscriptIsReReadAndReplacesWhatItSaid(t *testing.T) {
 	}
 }
 
-// A transcript deleted between passes takes its numbers with it.
-func TestAPassForgetsTranscriptsThatHaveGone(t *testing.T) {
+// A transcript deleted between passes keeps what it counted.
+//
+// Claude Code deletes its transcripts after thirty days by default, and this
+// used to delete their numbers with them: the panel's oldest Claude day was
+// five weeks ago on a machine it had been counting since August.
+func TestADeletedTranscriptKeepsWhatItCounted(t *testing.T) {
 	root := t.TempDir()
 	path := writeTranscript(t, root, "a.jsonl",
 		claudeLine("2026-08-20T10:00:00.000Z", "s1", "/p", "m1", "r1", "opus", 1, 10, 0, 0)+"\n")
@@ -113,21 +117,99 @@ func TestAPassForgetsTranscriptsThatHaveGone(t *testing.T) {
 	if err := os.Remove(path); err != nil {
 		t.Fatalf("remove: %v", err)
 	}
-	in.RunNow(ctx)
+	second := in.RunNow(ctx)
+	third := in.RunNow(ctx)
 
 	days, err := db.UsageByDay(ctx, store.UsageFilter{})
 	if err != nil {
 		t.Fatalf("by day: %v", err)
 	}
-	if len(days) != 1 || days[0].Output != 3 {
-		t.Errorf("got %+v, want only b.jsonl's 3 output tokens; a deleted transcript "+
-			"is still being counted", days)
+	if len(days) != 1 || days[0].Output != 13 {
+		t.Errorf("got %+v, want 13 output tokens; a deleted transcript took its numbers with it", days)
+	}
+	if second.Read != 0 || third.Read != 0 {
+		t.Errorf("passes after the delete read %d and %d files, want none", second.Read, third.Read)
+	}
+	if second.Retired != 1 || third.Retired != 0 {
+		t.Errorf("retired %d then %d, want 1 then 0: a retired file is touched again on every pass",
+			second.Retired, third.Retired)
+	}
+
+	// Put back exactly as it was -- same bytes, same mtime, as a restore from
+	// a backup does: it is on disk again, so it is read as present again.
+	body := claudeLine("2026-08-20T10:00:00.000Z", "s1", "/p", "m1", "r1", "opus", 1, 10, 0, 0) + "\n"
+	writeTranscript(t, root, "a.jsonl", body)
+	stamps, err := db.UsageStamps(ctx)
+	if err != nil {
+		t.Fatalf("stamps: %v", err)
+	}
+	mtime := time.Unix(stamps[path].ModifiedAt, 0)
+	if err := os.Chtimes(path, mtime, mtime); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	in.RunNow(ctx)
+	if stamps, err = db.UsageStamps(ctx); err != nil {
+		t.Fatalf("stamps: %v", err)
+	}
+	if stamps[path].Gone {
+		t.Error("a transcript back on disk is still marked gone")
+	}
+	if days, err = db.UsageByDay(ctx, store.UsageFilter{}); err != nil || len(days) != 1 || days[0].Output != 13 {
+		t.Errorf("after the restore: %+v %v, want 13 output tokens, once", days, err)
+	}
+}
+
+// One request, counted once, however many transcripts carry it.
+//
+// A resumed Claude session replays its history into a new transcript, and a
+// forked subagent starts from its parent's; each file used to count the copy.
+// Measured here: 1,359 of 80,901 requests in two to eight files, 0.41B tokens.
+func TestARequestInTwoTranscriptsIsCountedOnce(t *testing.T) {
+	root := t.TempDir()
+	shared := claudeLine("2026-08-20T10:00:00.000Z", "s1", "/p", "m1", "r1", "opus", 1, 10, 0, 0)
+	first := writeTranscript(t, root, "a.jsonl", shared+"\n")
+	if err := os.MkdirAll(filepath.Join(root, "s1", "subagents"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeTranscript(t, filepath.Join(root, "s1", "subagents"), "agent-x.jsonl", shared+"\n"+
+		claudeLine("2026-08-20T11:00:00.000Z", "s1", "/p", "m2", "r2", "opus", 1, 3, 0, 0)+"\n")
+	in, db := ingester(t, root)
+	ctx := context.Background()
+	in.RunNow(ctx)
+
+	output := func() (int64, int64) {
+		t.Helper()
+		days, err := db.UsageByDay(ctx, store.UsageFilter{})
+		if err != nil || len(days) != 1 {
+			t.Fatalf("by day: %+v %v", days, err)
+		}
+		return days[0].Output, days[0].Requests
+	}
+	if out, req := output(); out != 13 || req != 2 {
+		t.Fatalf("got %d output in %d requests, want 13 in 2; the shared request was counted twice", out, req)
+	}
+
+	// The file that holds it is deleted: the copy must not start counting.
+	if err := os.Remove(first); err != nil {
+		t.Fatal(err)
+	}
+	in.RunNow(ctx)
+	if out, req := output(); out != 13 || req != 2 {
+		t.Errorf("after the holder was deleted: %d output in %d requests, want 13 in 2", out, req)
+	}
+
+	// And the copy grows: re-read, it still leaves the held request out.
+	appendLine(t, filepath.Join(root, "s1", "subagents", "agent-x.jsonl"),
+		claudeLine("2026-08-20T12:00:00.000Z", "s1", "/p", "m3", "r3", "opus", 1, 5, 0, 0))
+	in.RunNow(ctx)
+	if out, req := output(); out != 18 || req != 3 {
+		t.Errorf("after the copy grew: %d output in %d requests, want 18 in 3", out, req)
 	}
 }
 
 // A root the pass could not look at is not a root whose transcripts are gone.
 //
-// The sweep that forgets deleted transcripts was driven by "everything the
+// The sweep that retires deleted transcripts (it used to forget them) is driven by "everything the
 // last pass knew about that this pass did not see", and a walk that could not
 // enumerate its root returns an empty list — so one moment of a missing
 // directory (a remount, an agent updating itself, a chmod on a subdirectory)
@@ -167,8 +249,14 @@ func TestARootThatCannotBeReadDoesNotForgetItsTranscripts(t *testing.T) {
 		t.Errorf("the cursor holds %d transcripts, want 1; the whole corpus will be "+
 			"re-read from cold when the directory comes back", len(stamps))
 	}
+	for p, st := range stamps {
+		if st.Gone {
+			t.Errorf("%s was retired because its root could not be read", p)
+		}
+	}
 
-	// And the sweep still works once the root is readable again.
+	// And a delete is still noticed once the root is readable again: retired,
+	// its numbers kept.
 	if err := os.Rename(away, root); err != nil {
 		t.Fatalf("rename back: %v", err)
 	}
@@ -179,9 +267,14 @@ func TestARootThatCannotBeReadDoesNotForgetItsTranscripts(t *testing.T) {
 	if days, err = db.UsageByDay(ctx, store.UsageFilter{}); err != nil {
 		t.Fatalf("by day: %v", err)
 	}
-	if len(days) != 0 {
-		t.Errorf("got %+v, want nothing; a transcript deleted from a root that was "+
-			"read must still take its numbers with it", days)
+	if len(days) != 1 || days[0].Output != 10 {
+		t.Errorf("got %+v, want the 10 output tokens kept after the delete", days)
+	}
+	if stamps, err = db.UsageStamps(ctx); err != nil {
+		t.Fatalf("stamps: %v", err)
+	}
+	if st := stamps[filepath.Join(root, "a.jsonl")]; !st.Gone {
+		t.Errorf("a transcript deleted from a root that was read is not retired: %+v", st)
 	}
 }
 
@@ -373,5 +466,17 @@ func TestRowsFromAnOlderReaderAreReadAgain(t *testing.T) {
 	if again := in.RunNow(ctx); again.Read != 0 {
 		t.Errorf("the pass after re-read %d transcripts; the new version was not recorded",
 			again.Read)
+	}
+}
+
+func appendLine(t *testing.T, path, line string) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open %s: %v", path, err)
+	}
+	defer f.Close() //nolint:errcheck // test file
+	if _, err := f.WriteString(line + "\n"); err != nil {
+		t.Fatalf("append: %v", err)
 	}
 }

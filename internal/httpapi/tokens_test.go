@@ -23,10 +23,12 @@ func seedTranscript(t *testing.T, srv *Server, name, cwd string, day string, out
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
+	// Ids of its own: each seeded transcript is a different request, and one
+	// request carried by two transcripts is counted once (migration 036).
 	line := fmt.Sprintf(`{"type":"assistant","timestamp":%q,"sessionId":%q,"cwd":%q,`+
-		`"requestId":"r1","message":{"id":"m1","model":"opus","usage":`+
+		`"requestId":"r-%s","message":{"id":"m-%s","model":"opus","usage":`+
 		`{"input_tokens":1,"output_tokens":%d,"cache_creation_input_tokens":0,`+
-		`"cache_read_input_tokens":0}}}`, day+"T12:00:00.000Z", name, cwd, out)
+		`"cache_read_input_tokens":0}}}`, day+"T12:00:00.000Z", name, cwd, name, name, out)
 	if err := os.WriteFile(filepath.Join(root, name+".jsonl"), []byte(line+"\n"), 0o600); err != nil {
 		t.Fatalf("write transcript: %v", err)
 	}

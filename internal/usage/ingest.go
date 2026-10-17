@@ -35,7 +35,9 @@ const MinInterval = 30 * time.Second
 //	   its first placeholder, and skips all-zero "<synthetic>" records; a
 //	   forked Codex thread no longer counts its parent's replayed history;
 //	   opencode's cursor includes its write-ahead log.
-const ReaderVersion = 1
+//	2  Claude requests carry a key, and a request another transcript already
+//	   counts is not counted again (migration 036).
+const ReaderVersion = 2
 
 // sessionLimit bounds the per-session table an API response carries.
 const sessionLimit = 200
@@ -52,7 +54,11 @@ type Pass struct {
 	// gap between them is what the (size, mtime) cursor saved.
 	Read int
 	Seen int
-	Err  string
+	// Retired is how many transcripts this pass found gone and kept the
+	// numbers of. Zero on every pass after the one that noticed: a file
+	// already retired is not touched again.
+	Retired int
+	Err     string
 }
 
 // Ingester keeps the database in step with the transcripts on disk.
@@ -175,11 +181,14 @@ func (in *Ingester) run(ctx context.Context) Pass {
 
 	// Everything the last pass knew about, and which agent's root it was found
 	// under. Whatever is still in here when the walk finishes is a transcript
-	// that has been deleted, and its rows go too -- but only for a root this
-	// pass actually managed to enumerate.
+	// that has been deleted, and it is retired -- its rows kept, never read
+	// again -- but only for a root this pass actually managed to enumerate.
+	// Ones already retired are not in here: there is nothing more to do.
 	gone := make(map[string]string, len(stamps))
 	for path, s := range stamps {
-		gone[path] = s.Tool
+		if !s.Gone {
+			gone[path] = s.Tool
+		}
 	}
 	enumerated := make(map[string]bool, len(Tools))
 
@@ -201,13 +210,39 @@ func (in *Ingester) run(ctx context.Context) Pass {
 			//
 			// The reader version is part of the same comparison: rows written
 			// by an older reader are stale however still the file has been.
+			//
+			// A retired file found on disk again is read as new.
 			if s, ok := stamps[path]; ok && s.Size == ref.Size && s.ModifiedAt == ref.ModifiedAt &&
-				s.Reader == ReaderVersion {
+				s.Reader == ReaderVersion && !s.Gone {
 				continue
 			}
 			f := in.Scanner.ReadFile(tool, path)
 			p.Read++
 			src.Skipped += f.Skipped
+			// One request, one count, however many transcripts carry it. A
+			// resumed Claude session replays its history into a new file and a
+			// forked subagent starts from its parent's; each of those copies
+			// used to count again.
+			var keys []int64
+			if f.Requests != nil {
+				all := make([]int64, len(f.Requests))
+				for i, r := range f.Requests {
+					all[i] = r.Key
+				}
+				held, herr := in.DB.UsageKeysHeldElsewhere(ctx, path, all)
+				if herr != nil {
+					p.Err = herr.Error()
+					continue
+				}
+				own := f.Requests[:0:0]
+				for _, r := range f.Requests {
+					if !held[r.Key] {
+						own = append(own, r)
+						keys = append(keys, r.Key)
+					}
+				}
+				f.Buckets = Aggregate(own)
+			}
 			rows := make([]store.UsageRow, 0, len(f.Buckets))
 			for _, b := range f.Buckets {
 				rows = append(rows, store.UsageRow{
@@ -219,6 +254,7 @@ func (in *Ingester) run(ctx context.Context) Pass {
 			if err := in.DB.ReplaceUsageFile(ctx, store.UsageFile{
 				Path: path, Tool: string(tool), Size: f.Size, ModifiedAt: f.ModifiedAt,
 				Skipped: f.Skipped, Problem: f.Problem, Reader: ReaderVersion, Rows: rows,
+				Keys: keys,
 			}); err != nil {
 				// One unreadable transcript is a gap, not a reason to abandon
 				// the other four hundred.
@@ -247,7 +283,8 @@ func (in *Ingester) run(ctx context.Context) Pass {
 			paths = append(paths, path)
 		}
 		sort.Strings(paths)
-		if err := in.DB.ForgetUsageFiles(ctx, paths); err != nil && p.Err == "" {
+		p.Retired = len(paths)
+		if err := in.DB.RetireUsageFiles(ctx, paths); err != nil && p.Err == "" {
 			p.Err = err.Error()
 		}
 	}

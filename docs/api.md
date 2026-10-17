@@ -182,6 +182,15 @@ never started is counted, and a session the panel did start that ran something
 with no transcript is not. Nothing is estimated; there is no token count derived
 from character counts anywhere in this.
 
+**A transcript that is deleted keeps what it counted.** Claude Code removes
+transcripts after `cleanupPeriodDays` (thirty by default); the rows read from
+them stay, so `byMonth`, `heatmap` and any long range are not emptied a month at
+a time. A file that comes back at the same path is read again as new. And **a
+request is counted once** however many transcripts carry it -- a resumed session
+replays its history into a new file, a forked subagent starts from its parent's
+-- by Claude Code's `message.id` and `requestId`, held by the first transcript
+that recorded it.
+
 `session` is the **agent's** session id, out of its own transcript. It is not a
 vibepanel session id and there is no mapping between them: neither agent
 publishes the id of the transcript it is writing, so the honest unit is the
