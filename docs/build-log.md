@@ -26452,3 +26452,12 @@ the panel once with container queries denied and once with the bundle
 replaced by something that does not parse, and reads both messages; with
 the script removed both cases go silent and the app draws over an engine
 that cannot lay it out.
+
+## 2026-10-17 — A test swapped the adapter's clock while Run was reading it
+
+v1.29.2's first build failed in `internal/chat/weixin`: `race detected
+during execution of test`, in a test this release had not touched. Two
+tests replaced `a.now` with a bare assignment while `Run` was polling on
+its own goroutine, and `admit` reads the clock under `a.mu`. Thirty local
+runs never hit it; the two-core runner did, once. The tests go through
+`setClock`, which takes the lock. The adapter is unchanged.

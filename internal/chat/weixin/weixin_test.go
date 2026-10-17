@@ -302,6 +302,16 @@ func newAdapter(t *testing.T, f *fake, state string) *Adapter {
 // running starts Run with a recording sink and stops it at the end. The
 // returned stop cancels and waits; calling it twice is fine, because the
 // cleanup calls it too.
+// setClock swaps the adapter's clock under its lock. Run is polling on its
+// own goroutine and admit reads a.now() under a.mu, so a bare assignment from
+// the test is a data race -- reported once on the release runner, never
+// here in thirty runs, which is the kind of race the detector exists for.
+func setClock(a *Adapter, now func() time.Time) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.now = now
+}
+
 func running(t *testing.T, a *Adapter) (*recSink, func() error) {
 	t.Helper()
 	s := newSink()
@@ -441,7 +451,7 @@ func TestLoginExpiredBlockedAndUnknown(t *testing.T) {
 		t.Fatal("SubmitCode for an unknown sign-in succeeded")
 	}
 	// A sign-in older than its TTL is expired without asking the server.
-	a.now = func() time.Time { return time.Now().Add(loginTTL + time.Minute) }
+	setClock(a, func() time.Time { return time.Now().Add(loginTTL + time.Minute) })
 	if st, _ := a.LoginStatus(ctx, l.ID); st.Status != "expired" {
 		t.Fatalf("stale: %+v", st)
 	}
@@ -1018,7 +1028,7 @@ func TestTypingFetchesTheTicketOnceAndKeepsItAlive(t *testing.T) {
 		t.Fatal("getconfig called again with a fresh ticket cached")
 	}
 	// A day later it is fetched again; another person gets their own.
-	a.now = func() time.Time { return time.Now().Add(ticketTTL + time.Minute) }
+	setClock(a, func() time.Time { return time.Now().Add(ticketTTL + time.Minute) })
 	_ = a.Typing(ctx, peer, true)
 	_ = a.Typing(ctx, peer, false)
 	if len(f.calls("getconfig")) != 2 {
