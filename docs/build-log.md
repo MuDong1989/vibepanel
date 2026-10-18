@@ -26506,3 +26506,25 @@ earlier point -- releases the keys it dropped, and another transcript that
 skipped them does not count them until something makes it read again. Rare,
 and it undercounts rather than double-counts; the fix is to re-read the files
 whose skipped keys were released, which needs the skipped keys recorded too.
+
+## 2026-10-18 — Revealing a terminal keeps its grid
+
+A Claude Code status line disappeared after switching away from a session and
+back; changing the terminal area's size restored it. The reveal effect called
+`fit()` as well as `refresh()`, separately from the sizing effect that decides
+whether this viewer controls the grid. A passive viewer's host is already
+`max-content`, sized to the authoritative grid. Fitting that box can round a
+fractional cell height down by a row, resizing only the local xterm and
+discarding a full-screen application's last row. Repainting cannot recover
+discarded buffer content; a real resize makes the application draw it again.
+
+Revealing now only refreshes the renderer. Fitting stays in the existing sizing
+path, where controlling viewers publish their size and passive viewers keep
+the server's grid. No terminal is recreated and no synthetic resize is sent.
+
+The render check and `make statusline-check` share a quiet alternate-screen
+fixture with a footer on its last row and the cursor above it. The fixture
+redraws only on SIGWINCH. A
+second, passive viewer at a fractional pixel ratio switches away and back
+three times, checking both the local row count against the server's and the
+footer itself, without resizing the window to repair it first.
