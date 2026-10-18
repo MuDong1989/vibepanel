@@ -26499,3 +26499,10 @@ bytes and mtime), `TestARequestInTwoTranscriptsIsCountedOnce` (once, still
 once after the holder is deleted, still once after the copy grows),
 `TestARetiredTranscriptKeepsItsNumbers` and `TestARequestIsHeldByOneTranscript`
 in the store. Each guard was removed in turn and each removal fails one of them.
+
+Next, one edge left open on purpose: a transcript that holds some requests and
+is later rewritten shorter -- Claude Code rewriting one on a resume from an
+earlier point -- releases the keys it dropped, and another transcript that
+skipped them does not count them until something makes it read again. Rare,
+and it undercounts rather than double-counts; the fix is to re-read the files
+whose skipped keys were released, which needs the skipped keys recorded too.
